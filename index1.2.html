@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>BluntMan 4:20 Edition</title>
+<style>
+  :root { --sky1:#1a0d33; --sky2:#1f6b4b; --ink:#f4f1ea; --accent:#8cff6b; }
+  * { box-sizing: border-box; margin:0; padding:0; -webkit-tap-highlight-color: transparent; }
+  html, body { width:100%; height:100%; background:#0e0719; color:var(--ink); font-family: "Trebuchet MS", system-ui, sans-serif; overflow:hidden; touch-action:none; }
+  #wrap { width:100%; height:100%; display:flex; align-items:center; justify-content:center; padding:8px; }
+  #game { position:relative; width:min(calc(100vw - 16px), calc((100dvh - 16px) * .625)); aspect-ratio:5 / 8; }
+  canvas { display:block; width:100%; height:100%; background:linear-gradient(var(--sky1), var(--sky2)); border-radius:10px; box-shadow:0 18px 60px #000a, 0 0 40px #8cff6b22; }
+  #tools { position:absolute; z-index:2; inset:10px 10px auto; display:flex; justify-content:flex-end; gap:8px; }
+  .tool, .pad { border:1px solid #8cff6b55; color:var(--ink); background:#160c26cc; font:600 13px "Trebuchet MS", system-ui, sans-serif; cursor:pointer; touch-action:none; }
+  .tool { min-height:36px; padding:0 11px; border-radius:6px; }
+  .tool:hover, .pad:active { background:#2b1a46; }
+  #pads { position:absolute; z-index:2; inset:auto 12px 14px; display:flex; justify-content:space-between; pointer-events:none; }
+  .pad { width:58px; height:58px; border-radius:50%; font-size:24px; pointer-events:auto; background:#160c2688; }
+  [hidden] { display:none !important; }
+  @media (pointer:fine) { #pads { opacity:.45; } }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <main id="game" aria-label="BluntMan game">
+    <canvas id="c" width="400" height="640" aria-label="BluntMan playfield"></canvas>
+    <div id="tools">
+      <button class="tool" id="sound" type="button" aria-pressed="false" aria-label="Turn sound on">SFX OFF</button>
+      <button class="tool" id="pause" type="button" aria-label="Pause game" hidden>Pause</button>
+    </div>
+    <div id="pads" hidden>
+      <button class="pad" id="left" type="button" aria-label="Move left">‹</button>
+      <button class="pad" id="right" type="button" aria-label="Move right">›</button>
+    </div>
+  </main>
+</div>
+
+<script>
+/* ===== BLUNTMAN: 4:20 EDITION =====
+   Controls: Left/Right arrows or A/D, touch pads, or tap either side of the playfield.
+   Score = height climbed (meters). Every 420 m you get a "BLAZE IT" banner. */
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const soundButton = document.getElementById('sound');
+const pauseButton = document.getElementById('pause');
+const pads = document.getElementById('pads');
+const leftButton = document.getElementById('left');
+const rightButton = document.getElementById('right');
+const W = canvas.width, H = canvas.height;
+
+// ---- Tunable settings ----
+const GRAVITY = 0.42;
+const JUMP = -11.5;
+const ROLLING_PAPER_JUMP = -15.5;
+const SPRING_JUMP = -19;
+const MOVE_SPEED = 5.2;
+const PLATFORM_W = 70, PLATFORM_H = 14;
+const ROLLING_PAPER_CHANCE = 0.035;
+const PX_PER_METER = 10;       // pixels of climbing per 1 m of height
+const MILESTONE = 420;         // banner every 420 m
+const CREW_SKIN = '#b9a0e0';   // skin color of the floating crew enemies (change freely)
+const SFX_VOLUME = 0.07;
+const DEATH_SHAKE_MS = 320;
+const DEATH_SHAKE_PX = 7;
+
+// ---- State ----
+let state = 'menu';            // menu | play | paused | over
+let player, platforms, enemies, coins, powerups, particles, camY, score, coinCount, best;
+let leaderboard = [];
+let nextMilestone = MILESTONE, milestoneTimer = 0;
+let shakeUntil = 0;
+const keys = { left:false, right:false };
+let touchDir = 0;
+let soundOn = false;
+let audioContext;
+let combo = 0;
+const stars = Array.from({ length:30 }, (_, i) => ({ x:(i * 137) % W, y:(i * 89) % H, size:i % 4 === 0 ? 3 : 2 }));
+const bgLeaves = Array.from({ length:12 }, (_, i) => ({ x:(i * 97) % W, y:(i * 131) % (H + 80), s:2.5 + (i % 4) * 1.2, rot:(i * .7) % 6, par:.15 + (i % 3) * .08, sway:i * 1.3 }));
+
+try {
+  const savedBest = parseInt(localStorage.getItem('bluntManBest') || '0', 10);
+  best = Number.isFinite(savedBest) && savedBest >= 0 ? savedBest : 0;
+} catch(e) { best = 0; }
+try {
+  const savedLeaderboard = JSON.parse(localStorage.getItem('bluntManLeaderboard') || '[]');
+  if (Array.isArray(savedLeaderboard)) {
+    leaderboard = savedLeaderboard
+      .filter(entry => entry && typeof entry.name === 'string' && Number.isFinite(entry.score) && entry.score >= 0)
+      .map(entry => ({ name:entry.name.slice(0, 12), score:Math.floor(entry.score) }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 10);
+  }
+} catch(e) { leaderboard = []; }
+try { soundOn = localStorage.getItem('bluntManSound') === '1'; } catch(e) {}
+
+function setState(next) {
+  state = next;
+  const playing = state === 'play';
+  pauseButton.hidden = !playing && state !== 'paused';
+  pauseButton.textContent = state === 'paused' ? 'Resume' : 'Pause';
+  pauseButton.setAttribute('aria-label', state === 'paused' ? 'Resume game' : 'Pause game');
+  pads.hidden = !playing;
+}
+
+function updateSoundButton() {
+  soundButton.textContent = soundOn ? 'SFX ON' : 'SFX OFF';
+  soundButton.setAttribute('aria-pressed', String(soundOn));
+  soundButton.setAttribute('aria-label', soundOn ? 'Turn sound off' : 'Turn sound on');
+}
+
+function playSound(kind) {
+  if (!soundOn) return;
+  try {
+    const Audio = window.AudioContext || window.webkitAudioContext;
+    if (!Audio) return;
+    audioContext ||= new Audio();
+    if (audioContext.state === 'suspended') audioContext.resume();
+    const now = audioContext.currentTime;
+    const note = (startHz, endHz, offset, duration, wave = 'sine', volume = SFX_VOLUME) => {
+      const oscillator = audioContext.createOscillator();
+      const gain = audioContext.createGain();
+      const start = now + offset;
+      oscillator.type = wave;
+      oscillator.frequency.setValueAtTime(startHz, start);
+      oscillator.frequency.exponentialRampToValueAtTime(Math.max(35, endHz), start + duration);
+      gain.gain.setValueAtTime(.001, start);
+      gain.gain.linearRampToValueAtTime(volume, start + .008);
+      gain.gain.exponentialRampToValueAtTime(.001, start + duration);
+      oscillator.connect(gain); gain.connect(audioContext.destination);
+      oscillator.start(start); oscillator.stop(start + duration + .01);
+    };
+
+    if (kind === 'jump') note(330, 570, 0, .14, 'triangle');
+    else if (kind === 'spring') { note(440, 880, 0, .22, 'triangle'); note(660, 1100, .04, .2, 'sine', .035); }
+    else if (kind === 'leaf') { note(720, 1050, 0, .11, 'sine'); note(960, 1380, .07, .13, 'sine', .05); }
+    else if (kind === 'jetpack') { note(260, 520, 0, .24, 'sawtooth', .045); note(390, 780, .05, .2, 'triangle', .04); }
+    else if (kind === 'stomp') { note(170, 48, 0, .16, 'triangle', .09); note(95, 42, 0, .12, 'square', .035); }
+    else if (kind === 'gameover') {
+      note(330, 260, 0, .2, 'sawtooth', .055);
+      note(247, 185, .17, .24, 'sawtooth', .05);
+      note(165, 70, .37, .38, 'triangle', .06);
+    } else if (kind === 'milestone') {
+      note(660, 720, 0, .2, 'sine');
+      note(830, 900, .09, .22, 'sine', .06);
+      note(990, 1180, .18, .3, 'triangle', .055);
+      note(1320, 1320, .28, .4, 'sine', .035);
+    }
+  } catch(e) {}
+}
+
+function burst(x, y, color, count = 8) {
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = rand(1, 3.5);
+    particles.push({ x, y, vx:Math.cos(angle) * speed, vy:Math.sin(angle) * speed, life:24, maxLife:24, color, size:rand(2, 4) });
+  }
+}
+
+function smoke(x, y) {
+  particles.push({ x, y, vx:rand(-.3, .3), vy:-rand(.6, 1.2), g:-0.01, life:34, maxLife:34, color:'#cfd6da', size:rand(3, 5) });
+}
+
+function rand(a, b) { return a + Math.random() * (b - a); }
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+function reset() {
+  player = { x: W/2 - 13, y: H - 130, w: 26, h: 52, vx: 0, vy: JUMP, face: 1, t: 0, jetpack: 0 };
+  platforms = []; enemies = []; coins = []; powerups = []; particles = [];
+  camY = 0; score = 0; coinCount = 0; combo = 0;
+  nextMilestone = MILESTONE; milestoneTimer = 0;
+  platforms.push({ x: W/2 - PLATFORM_W/2, y: H - 60, type: 'normal', dx: 0, broken: false });
+  let y = H - 60;
+  while (y > -H) { y -= rand(55, 95); addPlatform(y); }
+  setState('play');
+}
+
+function addPlatform(y) {
+  const difficulty = Math.min(camY / 6000, 1);
+  const r = Math.random();
+  let type = 'normal';
+  const movingChance = 0.15 + difficulty * 0.2;
+  if (r < movingChance) type = 'moving';
+  else if (r < movingChance + ROLLING_PAPER_CHANCE) type = 'rolling';
+  else if (r < 0.28 + difficulty * 0.3 + ROLLING_PAPER_CHANCE) type = 'breaking';
+  const p = { x: rand(0, W - PLATFORM_W), y, type, dx: type === 'moving' ? rand(1, 2) * (Math.random() < .5 ? -1 : 1) : 0, broken: false, spring: false };
+  if (type === 'normal' && Math.random() < 0.08) p.spring = true;
+  platforms.push(p);
+  if (Math.random() < 0.3) coins.push({ x: p.x + PLATFORM_W/2, y: y - 30, taken: false });
+  if (Math.random() < 0.035) powerups.push({ x:p.x + PLATFORM_W/2, y:y - 34, taken:false });
+  if (camY > 1200 && Math.random() < 0.05 + difficulty * 0.06) {
+    const kind = camY > 3500 && Math.random() < .3 ? 'chaser' : Math.random() < .5 ? 'hover' : 'patrol';
+    enemies.push({ x:rand(20, W - 70), y:y - 50, w:42, h:46, dx:rand(.8, 1.6) * (Math.random() < .5 ? -1 : 1), kind, phase:Math.random() * Math.PI * 2, baseY:y - 50 });
+  }
+}
+
+// ---- Input ----
+addEventListener('keydown', e => {
+  if (e.key === 'ArrowLeft' || e.key.toLowerCase() === 'a') { keys.left = true; e.preventDefault(); }
+  if (e.key === 'ArrowRight' || e.key.toLowerCase() === 'd') { keys.right = true; e.preventDefault(); }
+  if (e.key.toLowerCase() === 'p' && (state === 'play' || state === 'paused')) togglePause();
+  if ((e.key === ' ' || e.key === 'Enter') && state !== 'play') {
+    if (state === 'paused') setState('play'); else reset();
+    e.preventDefault();
+  }
+});
+addEventListener('keyup', e => {
+  if (e.key === 'ArrowLeft' || e.key.toLowerCase() === 'a') keys.left = false;
+  if (e.key === 'ArrowRight' || e.key.toLowerCase() === 'd') keys.right = false;
+});
+addEventListener('blur', () => { keys.left = false; keys.right = false; touchDir = 0; });
+function togglePause() { setState(state === 'play' ? 'paused' : 'play'); touchDir = 0; }
+function pointer(e, down) {
+  if (!down) { touchDir = 0; return; }
+  if (state !== 'play') { reset(); return; }
+  const r = canvas.getBoundingClientRect();
+  touchDir = (e.clientX - r.left) < r.width / 2 ? -1 : 1;
+}
+canvas.addEventListener('pointerdown', e => pointer(e, true));
+canvas.addEventListener('pointermove', e => { if (touchDir !== 0) pointer(e, true); });
+addEventListener('pointerup', e => pointer(e, false));
+addEventListener('pointercancel', () => { touchDir = 0; });
+pauseButton.addEventListener('click', togglePause);
+soundButton.addEventListener('click', () => {
+  soundOn = !soundOn;
+  try { localStorage.setItem('bluntManSound', soundOn ? '1' : '0'); } catch(e) {}
+  updateSoundButton();
+  if (soundOn) playSound('leaf');
+});
+function bindPad(button, direction) {
+  button.addEventListener('pointerdown', e => { e.preventDefault(); e.stopPropagation(); touchDir = direction; });
+  button.addEventListener('pointerup', e => { e.preventDefault(); e.stopPropagation(); if (touchDir === direction) touchDir = 0; });
+  button.addEventListener('pointercancel', () => { if (touchDir === direction) touchDir = 0; });
+  button.addEventListener('lostpointercapture', () => { if (touchDir === direction) touchDir = 0; });
+}
+bindPad(leftButton, -1); bindPad(rightButton, 1);
+updateSoundButton();
+
+// ---- Update ----
+function update() {
+  if (state !== 'play') return;
+
+  player.t += 0.3;
+  if (milestoneTimer > 0) milestoneTimer--;
+
+  // horizontal movement
+  const dir = (keys.right || touchDir === 1 ? 1 : 0) - (keys.left || touchDir === -1 ? 1 : 0);
+  player.vx = dir * MOVE_SPEED;
+  if (dir) player.face = dir;
+  player.x += player.vx;
+  if (player.x + player.w < 0) player.x = W;       // wrap around
+  if (player.x > W) player.x = -player.w;
+
+  // smoke curling off the cherry
+  if (Math.floor(player.t * 10) % 4 === 0) smoke(player.x + player.w/2, player.y);
+
+  // vertical movement
+  const previousBottom = player.y + player.h;
+  player.vy += GRAVITY;
+  if (player.jetpack > 0) {
+    player.vy = Math.min(player.vy, -4.4);
+    player.jetpack--;
+    if (player.jetpack % 8 === 0) burst(player.x + player.w/2, player.y + player.h, '#ff8b3d', 3);
+  }
+  player.y += player.vy;
+
+  // moving platforms
+  for (const p of platforms) {
+    if (p.type === 'moving') {
+      p.x += p.dx;
+      if (p.x < 0 || p.x + PLATFORM_W > W) { p.x = Math.max(0, Math.min(W - PLATFORM_W, p.x)); p.dx *= -1; }
+    }
+  }
+
+  // platform collisions (only when falling)
+  if (player.vy > 0) {
+    for (const p of platforms) {
+      if (p.broken) continue;
+      const feet = player.y + player.h;
+      if (previousBottom <= p.y && feet >= p.y &&
+          player.x + player.w - 3 > p.x && player.x + 3 < p.x + PLATFORM_W) {
+        if (p.type === 'breaking') p.broken = true;
+        player.vy = p.spring ? SPRING_JUMP : p.type === 'rolling' ? ROLLING_PAPER_JUMP : JUMP;
+        combo++;
+        burst(player.x + player.w/2, p.y, p.spring ? '#ff5a5a' : '#7be07b', 5);
+        playSound(p.spring || p.type === 'rolling' ? 'spring' : 'jump');
+        break;
+      }
+    }
+  }
+
+  // enemies
+  for (const e of enemies) {
+    e.phase += .045;
+    if (e.kind === 'chaser' && Math.abs((player.x + player.w/2) - (e.x + e.w/2)) < 190) {
+      e.dx += Math.sign(player.x - e.x) * .045;
+      e.dx = Math.max(-2.4, Math.min(2.4, e.dx));
+    }
+    e.x += e.dx;
+    if (e.x < 0 || e.x + e.w > W) { e.x = Math.max(0, Math.min(W - e.w, e.x)); e.dx *= -1; }
+    if (e.kind === 'hover') e.y = e.baseY + Math.sin(e.phase) * 18;
+    const hit = player.x < e.x + e.w && player.x + player.w > e.x && player.y < e.y + e.h && player.y + player.h > e.y;
+    if (hit) {
+      if (player.vy > 2 && player.y + player.h - e.y < 18) {
+        e.dead = true; player.vy = JUMP; combo++; burst(e.x + e.w/2, e.y + e.h/2, '#d6a7ff', 14); playSound('stomp');
+      } else if (!player.jetpack) { gameOver(); break; }
+    }
+  }
+  enemies = enemies.filter(e => !e.dead);
+  if (state !== 'play') return;
+
+  // weed leaves
+  for (const c of coins) {
+    if (!c.taken && Math.hypot(player.x + player.w/2 - c.x, player.y + player.h/2 - c.y) < 28) {
+      c.taken = true; coinCount++; burst(c.x, c.y, '#5cc83f', 10); playSound('leaf');
+    }
+  }
+
+  for (const item of powerups) {
+    if (!item.taken && Math.hypot(player.x + player.w/2 - item.x, player.y + player.h/2 - item.y) < 30) {
+      item.taken = true; player.jetpack = 100; burst(item.x, item.y, '#ff8b3d', 16); playSound('jetpack');
+    }
+  }
+  for (const particle of particles) {
+    particle.x += particle.vx; particle.y += particle.vy;
+    particle.vy += (particle.g ?? .08); particle.life--;
+  }
+  particles = particles.filter(particle => particle.life > 0);
+
+  // camera follows player upward
+  if (player.y < H * 0.4) {
+    const shift = H * 0.4 - player.y;
+    player.y = H * 0.4;
+    camY += shift;
+    score = Math.floor(camY / PX_PER_METER);       // SCORE = HEIGHT
+    for (const p of platforms) p.y += shift;
+    for (const e of enemies) { e.y += shift; if (e.kind === 'hover') e.baseY += shift; }
+    for (const c of coins) c.y += shift;
+    for (const item of powerups) item.y += shift;
+    for (const particle of particles) particle.y += shift;
+  }
+
+  // 420 m milestone
+  if (score >= nextMilestone) {
+    nextMilestone += MILESTONE;
+    milestoneTimer = 150;
+    burst(W/2, 140, '#8cff6b', 24);
+    playSound('milestone');
+  }
+
+  // cleanup + spawn new platforms above
+  platforms = platforms.filter(p => p.y < H + 40);
+  enemies = enemies.filter(e => e.y < H + 60);
+  coins = coins.filter(c => c.y < H + 40 && !c.taken);
+  powerups = powerups.filter(item => item.y < H + 40 && !item.taken);
+  let topY = H;
+  for (const p of platforms) if (p.y < topY) topY = p.y;
+  while (topY > -60) {
+    const gap = rand(55, 80 + Math.min(camY / 150, 40));   // gaps grow with height
+    topY -= gap;
+    addPlatform(topY);
+  }
+
+  // fell off screen
+  if (player.y > H) gameOver();
+}
+
+function gameOver() {
+  if (state === 'over') return;
+  setState('over'); touchDir = 0;
+  shakeUntil = performance.now() + DEATH_SHAKE_MS;
+  playSound('gameover');
+  if (score > best) {
+    best = score;
+    try { localStorage.setItem('bluntManBest', String(best)); } catch(e) {}
+  }
+}
+
+// ---- Drawing ----
+// Seven-pointed cannabis leaf. (x, y) is the base of the leaf, s scales it (1 = ~12px tall).
+function drawLeaf(x, y, s, rot = 0) {
+  ctx.save();
+  ctx.translate(x, y); ctx.rotate(rot); ctx.scale(s, s);
+  const leaflets = [[0,1,.2],[-38,.85,.17],[38,.85,.17],[-75,.65,.14],[75,.65,.14],[-108,.4,.1],[108,.4,.1]];
+  ctx.lineWidth = 1; ctx.strokeStyle = '#2f7d27'; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, 6); ctx.stroke();          // stem
+  for (const [angle, len, wd] of leaflets) {
+    ctx.save();
+    ctx.rotate(angle * Math.PI / 180);
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.quadraticCurveTo(-wd * 26, -len * 6, 0, -len * 12);
+    ctx.quadraticCurveTo(wd * 26, -len * 6, 0, 0);
+    ctx.fillStyle = '#5cc83f'; ctx.fill();
+    ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -len * 11); ctx.stroke(); // center vein
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+// Hazy purple-to-green background with drifting smoke and leaves.
+function drawBackground() {
+  const t = performance.now() / 1000;
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#1a0d33'); g.addColorStop(.55, '#3d1b66'); g.addColorStop(1, '#1f6b4b');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+  stars.forEach((star, i) => {
+    const sy = ((star.y + camY * 0.2) % H + H) % H;
+    ctx.fillStyle = 'rgba(255,255,255,' + (.18 + .17 * Math.sin(t * 2 + i)) + ')';
+    ctx.fillRect(star.x, sy, star.size, star.size);
+  });
+
+  ctx.fillStyle = 'rgba(210,190,255,.06)';
+  for (let i = 0; i < 6; i++) {
+    const cx = ((i * 173 + t * (6 + i * 2)) % (W + 240)) - 120;
+    const cy = (((i * 211 + camY * .08) % (H + 120)) + H + 120) % (H + 120) - 60;
+    const rx = 70 + (i % 3) * 25;
+    ctx.beginPath(); ctx.ellipse(cx, cy, rx, 26, 0, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(cx + rx * .4, cy - 14, rx * .6, 22, 0, 0, 7); ctx.fill();
+  }
+
+  ctx.globalAlpha = .16;
+  for (const l of bgLeaves) {
+    const lx = l.x + Math.sin(t + l.sway) * 14;
+    const ly = (((l.y + camY * l.par) % (H + 80)) + H + 80) % (H + 80) - 40;
+    drawLeaf(lx, ly, l.s, l.rot + Math.sin(t * .8 + l.sway) * .3);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawMenuSmoke() {
+  const t = performance.now() / 1000;
+  ctx.save();
+  for (let i = 0; i < 4; i++) {
+    const phase = (t * .7 + i * .43) % 1.7;
+    const x = W/2 + Math.sin(t * 1.5 + i) * phase * 5;
+    const y = H - 128 - phase * 13;
+    ctx.globalAlpha = Math.sin(phase / 1.7 * Math.PI) * .2;
+    ctx.fillStyle = '#d8d0e2';
+    ctx.beginPath(); ctx.ellipse(x, y, 3 + phase * 1.5, 2 + phase, 0, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawPlayer() {
+  const { x, y, w, h } = player;
+  const top = -h / 2, bodyBot = top + 40, bw = w / 2;
+  const k = clamp(player.vy / 12, -1, 1);          // -1 = rising fast, +1 = falling fast
+  const f = (k + 1) / 2;                           // 0 rising, 1 falling
+  const t = player.t;
+  const dark = '#1b120a';
+
+  ctx.save();
+  ctx.translate(x + w / 2, y + h / 2);
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.strokeStyle = dark; ctx.lineWidth = 3;
+
+  // legs: bent and tucked while rising, straight and spread while falling
+  for (const sx of [-1, 1]) {
+    const hipX = sx * 5, hipY = bodyBot - 1;
+    const kneeX = hipX + sx * (6 - 3 * f), kneeY = hipY + 6;
+    const footX = hipX + sx * (1 + 6 * f);
+    const footY = hipY + 11 + 2 * f + Math.sin(t + (sx > 0 ? 0 : Math.PI)) * 1.2;
+    ctx.beginPath(); ctx.moveTo(hipX, hipY); ctx.lineTo(kneeX, kneeY); ctx.lineTo(footX, footY); ctx.lineTo(footX + sx * 3, footY); ctx.stroke();
+  }
+
+  // arms: raised when rising, out and down when falling, with a little wiggle
+  const shoulderY = top + 20;
+  for (const sx of [-1, 1]) {
+    const wig = Math.sin(t * 1.3 + (sx > 0 ? 0 : 1.5)) * 2;
+    const elbowX = sx * (bw + 7), elbowY = shoulderY - 2 + 5 * f;
+    const handX = sx * (bw + 9 + 3 * f), handY = shoulderY - 14 + 23 * f + wig;
+    ctx.beginPath(); ctx.moveTo(sx * bw, shoulderY); ctx.lineTo(elbowX, elbowY); ctx.lineTo(handX, handY); ctx.stroke();
+  }
+
+  // body: a rolled blunt, slightly tapered at the lit end
+  ctx.beginPath();
+  ctx.moveTo(-bw * .75, top + 4);
+  ctx.lineTo(-bw, top + 14);
+  ctx.lineTo(-bw, bodyBot - 6);
+  ctx.quadraticCurveTo(-bw, bodyBot, -bw + 4, bodyBot);
+  ctx.lineTo(bw - 4, bodyBot);
+  ctx.quadraticCurveTo(bw, bodyBot, bw, bodyBot - 6);
+  ctx.lineTo(bw, top + 14);
+  ctx.lineTo(bw * .75, top + 4);
+  ctx.closePath();
+  ctx.fillStyle = '#b0702a'; ctx.fill();
+  ctx.lineWidth = 2.5; ctx.stroke();
+  ctx.strokeStyle = '#8a5520'; ctx.lineWidth = 3;                     // shading on the right side
+  ctx.beginPath(); ctx.moveTo(bw - 4, top + 14); ctx.lineTo(bw - 4, bodyBot - 4); ctx.stroke();
+  ctx.strokeStyle = '#d09050'; ctx.lineWidth = 1.5;                   // wrap lines
+  ctx.beginPath(); ctx.moveTo(-bw + 3, top + 34); ctx.lineTo(bw - 6, top + 26); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(-bw + 3, top + 14); ctx.lineTo(bw - 8, top + 9); ctx.stroke();
+
+  // burning cherry on top
+  const flicker = Math.sin(performance.now() / 90) > 0;
+  ctx.fillStyle = '#3a3a3a'; ctx.beginPath(); ctx.ellipse(0, top + 7, bw * .85, 3, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = flicker ? '#ff4a2a' : '#ff2d1a'; ctx.beginPath(); ctx.ellipse(0, top + 3, bw * .78, 6, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = '#ffb347'; ctx.beginPath(); ctx.ellipse(0, top + 2, bw * .4, 3, 0, 0, 7); ctx.fill();
+
+  // face
+  const eyeY = top + 22;
+  for (const sx of [-1, 1]) {
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(sx * 5.5, eyeY, 4.2, 0, 7); ctx.fill();
+    ctx.fillStyle = dark; ctx.beginPath(); ctx.arc(sx * 5.5 + player.face * 1.5, eyeY + (k > 0 ? 1 : -.5), 2, 0, 7); ctx.fill();
+  }
+  ctx.strokeStyle = dark; ctx.fillStyle = dark; ctx.lineWidth = 2;
+  if (k < -.3) { ctx.beginPath(); ctx.arc(0, top + 31, 2.5, 0, 7); ctx.fill(); }       // "o" mouth while rocketing up
+  else { ctx.beginPath(); ctx.arc(0, top + 28, 4, .15 * Math.PI, .85 * Math.PI); ctx.stroke(); } // smile
+
+  // jetpack flames
+  if (player.jetpack > 0) {
+    ctx.fillStyle = '#ff7138';
+    for (const sx of [-1, 1]) {
+      ctx.beginPath(); ctx.moveTo(sx * 5 - 3, h / 2); ctx.lineTo(sx * 5, h / 2 + 14 + Math.random() * 8); ctx.lineTo(sx * 5 + 3, h / 2); ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+
+// Floating crew enemy: braided topknot, gold stud, bead chains, blue paisley robe, lit joint.
+// Drawn from the outfit and accessories in the reference, as a simple cartoon sprite.
+function drawCrew(e) {
+  const cx = e.x + e.w / 2, cy = e.y + e.h / 2;
+  const dir = e.dx >= 0 ? 1 : -1;
+  const ink = '#14102a', hair = '#17131f', skin = CREW_SKIN;
+  const glow = Math.sin(performance.now() / 110 + e.phase) > 0;
+
+  ctx.save();
+  ctx.translate(cx, cy); ctx.scale(dir, 1);
+  ctx.lineWidth = 2; ctx.strokeStyle = ink; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+
+  // robe with a wispy floating tail
+  ctx.beginPath();
+  ctx.moveTo(-17, 0); ctx.lineTo(17, 0); ctx.lineTo(14, 13);
+  ctx.quadraticCurveTo(7, 26, 0, 17); ctx.quadraticCurveTo(-7, 26, -14, 13);
+  ctx.closePath();
+  ctx.fillStyle = e.kind === 'chaser' ? '#c93a4a' : '#2f5fd0'; ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#dbe8ff';
+  for (const [px, py] of [[-9, 6], [8, 8], [0, 12], [-4, 3], [11, 3], [-12, 11]]) { ctx.beginPath(); ctx.arc(px, py, 1.3, 0, 7); ctx.fill(); }
+
+  // bead necklaces
+  ctx.fillStyle = '#f4f4f4';
+  for (const depth of [8, 13]) {
+    for (let i = 0; i <= 6; i++) {
+      const u = i / 6;
+      ctx.beginPath(); ctx.arc(-12 + 24 * u, 1 + depth * Math.sin(Math.PI * u), 1.8, 0, 7); ctx.fill();
+    }
+  }
+
+  // side braids
+  ctx.fillStyle = hair;
+  for (const sx of [-1, 1]) {
+    for (let i = 0; i < 4; i++) { ctx.beginPath(); ctx.arc(sx * (11 + i * .25), -13 + i * 5, 2.3, 0, 7); ctx.fill(); }
+  }
+
+  // head
+  ctx.fillStyle = skin; ctx.beginPath(); ctx.arc(0, -9, 10, 0, 7); ctx.fill(); ctx.stroke();
+
+  // hair cap and topknot
+  ctx.fillStyle = hair;
+  ctx.beginPath(); ctx.arc(0, -9, 10.5, Math.PI * 1.05, Math.PI * 1.95); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.arc(0, -21, 4, 0, 7); ctx.fill();
+
+  // heavy-lidded eyes, mustache, flat mouth
+  for (const sx of [-1, 1]) {
+    const ex = sx * 4, ey = -9;
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.ellipse(ex, ey, 3.2, 2.3, 0, 0, 7); ctx.fill();
+    ctx.fillStyle = ink; ctx.beginPath(); ctx.arc(ex + 1.5, ey + .5, 1.3, 0, 7); ctx.fill();
+    ctx.fillStyle = skin; ctx.fillRect(ex - 3.4, ey - 2.6, 6.8, 2.2);
+    ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(ex - 3.4, ey - .4); ctx.lineTo(ex + 3.4, ey - .4); ctx.stroke();
+  }
+  ctx.lineWidth = 1.6; ctx.beginPath(); ctx.moveTo(-3.5, -3.5); ctx.lineTo(3.5, -3.5); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(-2.5, -1.2); ctx.lineTo(2.5, -.8); ctx.stroke();
+
+  // ear and gold stud
+  ctx.lineWidth = 1.5; ctx.fillStyle = skin; ctx.beginPath(); ctx.arc(10, -8, 2.6, 0, 7); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#ffd84a'; ctx.beginPath(); ctx.arc(10, -6.5, 1.6, 0, 7); ctx.fill();
+
+  // hand holding a lit joint
+  ctx.lineWidth = 2; ctx.fillStyle = skin; ctx.beginPath(); ctx.arc(16, -1, 3.2, 0, 7); ctx.fill(); ctx.stroke();
+  ctx.strokeStyle = '#e9d3a0'; ctx.lineWidth = 2.6; ctx.beginPath(); ctx.moveTo(14, 0); ctx.lineTo(20, -10); ctx.stroke();
+  ctx.fillStyle = glow ? '#ff3b2a' : '#ff7a2a'; ctx.beginPath(); ctx.arc(20, -10, 1.9, 0, 7); ctx.fill();
+
+  ctx.restore();
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  ctx.save();
+  const shakeRemaining = shakeUntil - performance.now();
+  if (shakeRemaining > 0) {
+    const strength = DEATH_SHAKE_PX * shakeRemaining / DEATH_SHAKE_MS;
+    ctx.translate((Math.random() - .5) * strength, (Math.random() - .5) * strength);
+  }
+  drawBackground();
+
+  // platforms
+  for (const p of platforms) {
+    if (p.broken) continue;
+    const paper = p.type === 'rolling';
+    ctx.fillStyle = paper ? '#f4f1ea' : p.type === 'moving' ? '#6fd3ff' : p.type === 'breaking' ? '#b98a5a' : '#7be07b';
+    ctx.beginPath(); ctx.roundRect(p.x, p.y, PLATFORM_W, paper ? 6 : PLATFORM_H, paper ? 3 : 7); ctx.fill();
+    if (p.spring) { ctx.fillStyle = '#ff5a5a'; ctx.fillRect(p.x + PLATFORM_W/2 - 8, p.y - 8, 16, 8); }
+  }
+
+  // weed leaves
+  for (const c of coins) drawLeaf(c.x, c.y + 8, 1.5, Math.sin(performance.now() / 500 + c.x) * .12);
+
+  // jetpack pickups
+  for (const item of powerups) {
+    ctx.fillStyle = '#ff8b3d'; ctx.beginPath(); ctx.roundRect(item.x - 9, item.y - 12, 18, 24, 5); ctx.fill();
+    ctx.fillStyle = '#fff0c2'; ctx.fillRect(item.x - 3, item.y - 7, 6, 10);
+    ctx.fillStyle = '#ffdc70'; ctx.fillRect(item.x - 4, item.y + 12, 3, 6); ctx.fillRect(item.x + 1, item.y + 12, 3, 6);
+  }
+
+  // every enemy uses the floating crew sprite; chasers wear a red robe
+  for (const e of enemies) drawCrew(e);
+
+  for (const particle of particles) {
+    ctx.globalAlpha = particle.life / particle.maxLife;
+    ctx.fillStyle = particle.color;
+    ctx.fillRect(particle.x, particle.y, particle.size, particle.size);
+  }
+  ctx.globalAlpha = 1;
+
+  if (state !== 'menu') drawPlayer();
+
+  // HUD
+  ctx.fillStyle = '#f4f1ea'; ctx.font = 'bold 18px "Trebuchet MS", sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText('HEIGHT  ' + score + ' m', 14, 30);
+  ctx.textAlign = 'right';
+  const leavesText = 'x ' + coinCount;
+  ctx.fillText(leavesText, W - 14, 30);
+  drawLeaf(W - 14 - ctx.measureText(leavesText).width - 14, 31, 1.2);
+  if (combo > 1 && state === 'play') {
+    ctx.textAlign = 'center'; ctx.fillStyle = '#ffe080'; ctx.font = 'bold 15px "Trebuchet MS", sans-serif';
+    ctx.fillText('HOPS  ' + combo, W/2, 56);
+  }
+  if (player && player.jetpack > 0 && state === 'play') {
+    ctx.fillStyle = '#101a2080'; ctx.fillRect(W/2 - 48, 64, 96, 7);
+    ctx.fillStyle = '#ff8b3d'; ctx.fillRect(W/2 - 46, 66, 92 * player.jetpack / 100, 3);
+  }
+
+  // 420 m banner
+  if (milestoneTimer > 0 && state === 'play') {
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, milestoneTimer / 30);
+    ctx.textAlign = 'center';
+    ctx.shadowColor = '#a45bff'; ctx.shadowBlur = 16;
+    ctx.fillStyle = '#8cff6b'; ctx.font = 'bold 44px "Trebuchet MS", sans-serif';
+    ctx.fillText((nextMilestone - MILESTONE) + ' m', W/2, 140);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#ffe080'; ctx.font = 'bold 20px "Trebuchet MS", sans-serif';
+    ctx.fillText('BLAZE IT', W/2, 170);
+    ctx.restore();
+  }
+
+  // overlays
+  if (state === 'menu') {
+    ctx.fillStyle = 'rgba(13,6,26,.55)'; ctx.fillRect(0, 0, W, H);
+    drawLeaf(W/2, 175, 5.5);
+    ctx.textAlign = 'center';
+    ctx.save();
+    ctx.shadowColor = '#a45bff'; ctx.shadowBlur = 18;
+    ctx.fillStyle = '#8cff6b'; ctx.font = 'bold 52px "Trebuchet MS", sans-serif';
+    ctx.fillText('BLUNTMAN', W/2, 250);
+    ctx.restore();
+    ctx.fillStyle = '#ffe080'; ctx.font = 'bold 20px "Trebuchet MS", sans-serif';
+    ctx.fillText('4:20 EDITION', W/2, 282);
+    ctx.fillStyle = '#f4f1ea'; ctx.font = '20px "Trebuchet MS", sans-serif';
+    ctx.fillText('Best ' + best + ' m', W/2, 325);
+    ctx.fillStyle = '#ffb43a'; ctx.font = 'bold 19px "Trebuchet MS", sans-serif';
+    ctx.fillText('TAP OR PRESS SPACE TO START', W/2, 380);
+    ctx.font = '15px "Trebuchet MS", sans-serif'; ctx.fillStyle = '#d8c8f0';
+    ctx.fillText('Hop · Grab leaves · Dodge the floating crew', W/2, 424);
+    ctx.fillStyle = '#b6a4d4'; ctx.font = '13px "Trebuchet MS", sans-serif';
+    ctx.fillText('Reach 420 m to blaze it · Springs launch higher', W/2, 450);
+    ctx.textAlign = 'center'; ctx.fillStyle = '#8cff6b'; ctx.font = 'bold 15px "Trebuchet MS", sans-serif';
+    ctx.fillText('LOCAL TOP 10', W/2, 480);
+    if (leaderboard.length === 0) {
+      ctx.fillStyle = '#b6a4d4'; ctx.font = '13px "Trebuchet MS", sans-serif';
+      ctx.fillText('No runs saved yet', W/2, 505);
+    } else {
+      ctx.font = '12px "Trebuchet MS", sans-serif';
+      leaderboard.forEach((entry, index) => {
+        const column = index < 5 ? 0 : 1;
+        const rowY = 506 + (index % 5) * 21;
+        ctx.textAlign = 'left'; ctx.fillStyle = index === 0 ? '#ffe080' : '#f4f1ea';
+        ctx.fillText(String(index + 1).padStart(2, '0') + ' ' + entry.name, column ? 216 : 48, rowY);
+        ctx.textAlign = 'right';
+        ctx.fillText(entry.score + ' m', column ? 352 : 184, rowY);
+      });
+    }
+    drawMenuSmoke();
+    drawPlayer();
+  } else if (state !== 'play') {
+    ctx.fillStyle = 'rgba(13,6,26,.72)'; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center'; ctx.fillStyle = '#8cff6b';
+    ctx.font = 'bold 48px "Trebuchet MS", sans-serif';
+    ctx.fillText(state === 'over' ? 'BURNED OUT' : 'PAUSED', W/2, 220);
+    ctx.fillStyle = '#f4f1ea'; ctx.font = '20px "Trebuchet MS", sans-serif';
+    if (state === 'over') {
+      ctx.fillText('Height ' + score + ' m   |   Leaves ' + coinCount, W/2, 275);
+      ctx.fillText('Best ' + best + ' m', W/2, 315);
+      ctx.fillStyle = '#ffb43a'; ctx.font = 'bold 18px "Trebuchet MS", sans-serif';
+      ctx.fillText('TAP OR PRESS SPACE TO RETRY', W/2, 380);
+      ctx.font = '13px "Trebuchet MS", sans-serif'; ctx.fillStyle = '#b6a4d4';
+      ctx.fillText('Springs launch higher · Orange packs power your jet', W/2, 424);
+    } else {
+      ctx.fillStyle = '#ffb43a'; ctx.font = 'bold 19px "Trebuchet MS", sans-serif';
+      ctx.fillText('PRESS P OR TAP RESUME', W/2, 380);
+      ctx.font = '13px "Trebuchet MS", sans-serif'; ctx.fillStyle = '#b6a4d4';
+      ctx.fillText('Springs launch higher · Orange packs power your jet', W/2, 424);
+    }
+  }
+  ctx.restore();
+}
+
+let previousFrame = 0;
+let accumulator = 0;
+function loop(timestamp = 0) {
+  const elapsed = Math.min(timestamp - previousFrame, 50);
+  previousFrame = timestamp;
+  accumulator += elapsed;
+  while (accumulator >= 1000 / 60) { update(); accumulator -= 1000 / 60; }
+  draw();
+  requestAnimationFrame(loop);
+}
+reset();
+setState('menu');
+loop();
+</script>
+</body>
+</html>
